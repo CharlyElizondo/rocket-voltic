@@ -38,7 +38,7 @@ USER_DATABASE_PATH = os.environ.get(
     "USER_DATABASE_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "rocket_voltic_users.sqlite3"),
 )
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://rocket_voltic_db_user:puQcMHNbB56hWfoscJs6omFIcvszZku2@dpg-dc2pidutlv9c738qepj0-a/rocket_voltic_db").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PASSWORD_HASH_ITERATIONS = 600_000
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "Charlie").strip()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
