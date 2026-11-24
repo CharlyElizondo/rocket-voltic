@@ -11,6 +11,7 @@ import os
 import secrets
 import sqlite3
 import time 
+from datetime import date, datetime
 
 
 # ============================================================
@@ -37,7 +38,12 @@ USER_DATABASE_PATH = os.environ.get(
     "USER_DATABASE_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "rocket_voltic_users.sqlite3"),
 )
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PASSWORD_HASH_ITERATIONS = 600_000
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "Charlie").strip()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+if ADMIN_PASSWORD is None and APP_ENV != "production":
+    ADMIN_PASSWORD = "Charlieadmin2025"
 USER_SESSION_MAX_AGE = 8 * 60 * 60
 MAX_RECORD_TITLE_LENGTH = 120
 MAX_RECORD_DESCRIPTION_LENGTH = 4000
@@ -73,7 +79,68 @@ def version_switch_html(company_variant):
     )
 
 
+class PostgresCursor:
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    @staticmethod
+    def normalize_row(row):
+        if row is None:
+            return None
+        return tuple(
+            value.isoformat(sep=" ") if isinstance(value, datetime)
+            else value.isoformat() if isinstance(value, date)
+            else value
+            for value in row
+        )
+
+    def fetchone(self):
+        return self.normalize_row(self.cursor.fetchone())
+
+    def fetchall(self):
+        return [self.normalize_row(row) for row in self.cursor.fetchall()]
+
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
+
+
+class PostgresConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, query, parameters=()):
+        query = query.replace("?", "%s")
+        query = query.replace(
+            "username = %s COLLATE NOCASE",
+            "LOWER(username) = LOWER(%s)",
+        )
+        return PostgresCursor(self.connection.execute(query, parameters))
+
+    def __enter__(self):
+        self.connection.__enter__()
+        return self
+
+    def __exit__(self, error_type, error, traceback):
+        return self.connection.__exit__(error_type, error, traceback)
+
+    def close(self):
+        self.connection.close()
+
+    def commit(self):
+        self.connection.commit()
+
+
 def connect_user_database():
+    if DATABASE_URL:
+        try:
+            import psycopg
+        except ImportError as error:
+            raise RuntimeError(
+                "Instala psycopg para conectarte a PostgreSQL."
+            ) from error
+        return PostgresConnection(psycopg.connect(DATABASE_URL, connect_timeout=10))
+
     database_directory = os.path.dirname(os.path.abspath(USER_DATABASE_PATH))
     if database_directory:
         os.makedirs(database_directory, exist_ok=True)
@@ -83,6 +150,10 @@ def connect_user_database():
 
 
 def initialize_user_database():
+    if DATABASE_URL:
+        initialize_postgres_user_database()
+        return
+
     with closing(connect_user_database()) as connection:
         with connection:
             connection.execute("PRAGMA journal_mode = WAL")
@@ -186,6 +257,144 @@ def initialize_user_database():
             )
 
 
+def initialize_postgres_user_database():
+    with closing(connect_user_database()) as connection:
+        with connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_salt BYTEA NOT NULL,
+                    password_hash BYTEA NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'customer'
+                        CHECK (role IN ('customer', 'admin')),
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL "
+                "DEFAULT 'customer' CHECK (role IN ('customer', 'admin'))"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower "
+                "ON users (LOWER(username))"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    csrf_hash TEXT NOT NULL,
+                    created_at BIGINT NOT NULL,
+                    expires_at BIGINT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_records (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS service_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+                    customer_name TEXT NOT NULL,
+                    customer_contact TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    selected_products TEXT NOT NULL DEFAULT '[]',
+                    quoted_total BIGINT NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN (
+                            'pending', 'accepted', 'denied', 'in_progress', 'completed'
+                        )),
+                    solution TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    company_variant TEXT NOT NULL DEFAULT 'normal'
+                        CHECK (company_variant IN ('normal', 'premium'))
+                )
+                """
+            )
+            connection.execute(
+                "ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS "
+                "company_variant TEXT NOT NULL DEFAULT 'normal' "
+                "CHECK (company_variant IN ('normal', 'premium'))"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_records_owner "
+                "ON user_records(user_id, updated_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_service_requests_customer "
+                "ON service_requests(customer_user_id, created_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_service_requests_created "
+                "ON service_requests(created_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_service_requests_variant_created "
+                "ON service_requests(company_variant, created_at)"
+            )
+
+
+def ensure_bootstrap_admin():
+    if not ADMIN_PASSWORD:
+        raise RuntimeError(
+            "En producción configura ADMIN_PASSWORD con la contraseña del administrador."
+        )
+    if not ADMIN_USERNAME or len(ADMIN_USERNAME) > 64:
+        raise RuntimeError("ADMIN_USERNAME debe tener entre 1 y 64 caracteres.")
+    if len(ADMIN_PASSWORD) < 12 or len(ADMIN_PASSWORD) > 1024:
+        raise RuntimeError("ADMIN_PASSWORD debe tener entre 12 y 1024 caracteres.")
+
+    salt = secrets.token_bytes(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        ADMIN_PASSWORD.encode("utf-8"),
+        salt,
+        PASSWORD_HASH_ITERATIONS,
+    )
+    with closing(connect_user_database()) as connection:
+        with connection:
+            user = connection.execute(
+                "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+                (ADMIN_USERNAME,),
+            ).fetchone()
+            if user is None:
+                connection.execute(
+                    """
+                    INSERT INTO users (username, password_salt, password_hash, role)
+                    VALUES (?, ?, ?, 'admin')
+                    """,
+                    (ADMIN_USERNAME, salt, password_hash),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE users
+                    SET password_salt = ?, password_hash = ?, role = 'admin'
+                    WHERE id = ?
+                    """,
+                    (salt, password_hash, user[0]),
+                )
+                connection.execute(
+                    "DELETE FROM user_sessions WHERE user_id = ?",
+                    (user[0],),
+                )
+
+
 def register_user(username, password, role="customer"):
     username = username.strip()
     if not username or len(username) > 64 or any(ord(char) < 32 for char in username):
@@ -214,8 +423,13 @@ def register_user(username, password, role="customer"):
                     """,
                     (username, salt, password_hash, role),
                 )
-    except sqlite3.IntegrityError as error:
-        raise ValueError("Ya existe una cuenta con ese usuario.") from error
+    except Exception as error:
+        if (
+            isinstance(error, sqlite3.IntegrityError)
+            or error.__class__.__name__ == "UniqueViolation"
+        ):
+            raise ValueError("Ya existe una cuenta con ese usuario.") from error
+        raise
 
 
 def authenticate_user(username, password):
@@ -322,10 +536,13 @@ def create_user_record(user_id, title, description):
                 """
                 INSERT INTO user_records (user_id, title, description)
                 VALUES (?, ?, ?)
-                """,
+                """ + (" RETURNING id" if DATABASE_URL else ""),
                 (user_id, title, description),
             )
-            record_id = cursor.lastrowid
+            if DATABASE_URL:
+                record_id = cursor.fetchone()[0]
+            else:
+                record_id = cursor.lastrowid
     return get_user_record(user_id, record_id)
 
 
@@ -362,12 +579,17 @@ def current_month_request_count(connection=None, company_variant=DEFAULT_COMPANY
     if owns_connection:
         connection = connect_user_database()
     try:
+        monthly_filter = (
+            "created_at >= DATE_TRUNC('month', CURRENT_TIMESTAMP)"
+            if DATABASE_URL else
+            "strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')"
+        )
         return connection.execute(
-            """
+            f"""
             SELECT COUNT(*)
             FROM service_requests
             WHERE company_variant = ?
-              AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+              AND {monthly_filter}
             """,
             (company_variant,),
         ).fetchone()[0]
@@ -389,7 +611,13 @@ def create_service_request(
         raise ValueError("La versión de Rocket & Voltic no es válida.")
     company_plan = COMPANY_VARIANTS[company_variant]["plan"]
     with closing(connect_user_database()) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        if DATABASE_URL:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(?))",
+                (company_variant,),
+            )
+        else:
+            connection.execute("BEGIN IMMEDIATE")
         if (
             company_plan == "free"
             and current_month_request_count(connection, company_variant)
@@ -403,7 +631,7 @@ def create_service_request(
                 selected_products, quoted_total, company_variant
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+            """ + (" RETURNING id" if DATABASE_URL else ""),
             (
                 customer_user_id,
                 customer_name,
@@ -414,7 +642,10 @@ def create_service_request(
                 company_variant,
             ),
         )
-        request_id = cursor.lastrowid
+        if DATABASE_URL:
+            request_id = cursor.fetchone()[0]
+        else:
+            request_id = cursor.lastrowid
         connection.commit()
     return request_id
 
@@ -4143,8 +4374,10 @@ def main():
     )
     arguments = parser.parse_args()
 
+    initialize_user_database()
+    ensure_bootstrap_admin()
+
     if arguments.add_admin_user:
-        initialize_user_database()
         password = getpass.getpass("Contraseña del administrador (mínimo 12 caracteres): ")
         confirmation = getpass.getpass("Confirma la contraseña: ")
         if password != confirmation:
@@ -4157,8 +4390,6 @@ def main():
             return 1
         print(f"Cuenta administradora creada para '{arguments.add_admin_user.strip()}'.")
         return 0
-
-    initialize_user_database()
 
     server = ThreadingHTTPServer(
         (HOST, PORT),
@@ -4184,9 +4415,10 @@ def main():
 
     print()
 
-    print(
-        f"Base de datos de cuentas y solicitudes: {USER_DATABASE_PATH}"
+    database_label = (
+        "PostgreSQL (DATABASE_URL)" if DATABASE_URL else USER_DATABASE_PATH
     )
+    print(f"Base de datos de cuentas y solicitudes: {database_label}")
     print(
         "Versiones disponibles: Normal (30 solicitudes al mes) y Premium (ilimitado)"
     )
